@@ -1,5 +1,6 @@
 # 2.5 tensor exercise
 import IPython
+import IPython.display
 import numpy as np
 import torch
 import tvm
@@ -96,4 +97,94 @@ weight_tvm = tvm.nd.array(weight)
 conv_tvm = tvm.nd.array(np.empty((N, CO, OUT_H, OUT_W), dtype=np.int64))
 tvm.build(MyConv, target="llvm")["conv"](data_tvm, weight_tvm, conv_tvm)
 np.testing.assert_allclose(conv_tvm.numpy(), conv_torch, rtol=1e-5)
+
+## 2.5.2 transform TensorIR
+sch = tvm.tir.Schedule(MyAdd)
+block = sch.get_block("C", func_name="add")
+i, j = sch.get_loops(block)
+i0, i1 = sch.split(i, factors=[8, 16])
+sch.parallel(i0)
+sch.unroll(i1)
+sch.vectorize(j)
+IPython.display.Code(sch.mod.script(), language="python")
+
+@tvm.script.ir_module
+class MyBmmRelu:
+    @T.prim_func
+    def bmm_relu(A: T.Buffer((16, 128, 128), "float32"),
+                 B: T.Buffer((16, 128, 128), "float32"),
+                 C: T.Buffer((16, 128, 128), "float32")):
+        T.func_attr({"global_symbol": "bmm_relu", "tir.noalias": True})
+        Y = T.alloc_buffer([16, 128, 128], dtype="float32")
+        for n, i, j, k in T.grid(16, 128, 128, 128):
+            with T.block("Y"):
+                vn, vi, vj, vk = T.axis.remap("SSSR", [n, i, j, k])
+                with T.init():
+                    Y[vn, vi, vj] = T.float32(0)
+                Y[vn, vi, vj] = Y[vn, vi, vj] + A[vn, vi, vk] * B[vn, vk, vj]
+        for n, i, j in T.grid(16, 128, 128):
+            with T.block("C"):
+                vn, vi, vj = T.axis.remap("SSS", [n, i, j])
+                C[vn, vi, vj] = T.max(Y[vn, vi, vj], T.int64(0))
+
+@tvm.script.ir_module
+class TargetModule:
+    @T.prim_func
+    def bmm_relu(A: T.Buffer((16, 128, 128), "float32"), B: T.Buffer((16, 128, 128), "float32"), C: T.Buffer((16, 128, 128), "float32")) -> None:
+        T.func_attr({"global_symbol": "bmm_relu", "tir.noalias": True})
+        Y = T.alloc_buffer([16, 128, 128], dtype="float32")
+        for i0 in T.parallel(16):
+            for i1, i2_0 in T.grid(128, 16):
+                for ax0_init in T.vectorized(8):
+                    with T.block("Y_init"):
+                        n, i = T.axis.remap("SS", [i0, i1])
+                        j = T.axis.spatial(128, i2_0 * 8 + ax0_init)
+                        Y[n, i, j] = T.float32(0)
+                for ax1_0 in T.serial(32):
+                    for ax1_1 in T.unroll(4):
+                        for ax0 in T.serial(8):
+                            with T.block("Y_update"):
+                                n, i = T.axis.remap("SS", [i0, i1])
+                                j = T.axis.spatial(128, i2_0 * 8 + ax0)
+                                k = T.axis.reduce(128, ax1_0 * 4 + ax1_1)
+                                Y[n, i, j] = Y[n, i, j] + A[n, i, k] * B[n, k, j]
+                for i2_1 in T.vectorized(8):
+                    with T.block("C"):
+                        n, i = T.axis.remap("SS", [i0, i1])
+                        j = T.axis.spatial(128, i2_0 * 8 + i2_1)
+                        C[n, i, j] = T.max(Y[n, i, j], T.float32(0))
+
+sch = tvm.tir.Schedule(MyBmmRelu)
+block_Y = sch.get_block("Y", func_name="bmm_relu")
+n, i, j, k = sch.get_loops(block_Y)
+j0, j1 = sch.split(j, factors=[16, 8])
+k0, k1 = sch.split(k, factors=[32, 4])
+sch.reorder(j0, k0, k1, j1)
+sch.parallel(n)
+sch.unroll(k1)
+
+block_C = sch.get_block("C", func_name="bmm_relu")
+sch.reverse_compute_at(block_C, j0)
+block_Y_init = sch.decompose_reduction(block_Y, k0)
+_, _, _, init_j1 = sch.get_loops(block_Y_init)
+sch.vectorize(init_j1)
+
+_, _, _, c_j1 = sch.get_loops(block_C)
+sch.vectorize(c_j1)
+
+tvm.ir.assert_structural_equal(sch.mod, TargetModule)
+
+before_rt_lib = tvm.build(MyBmmRelu, target="llvm")
+after_rt_lib = tvm.build(sch.mod, target="llvm")
+a_tvm = tvm.nd.array(np.random.rand(16, 128, 128).astype("float32"))
+b_tvm = tvm.nd.array(np.random.rand(16, 128, 128).astype("float32"))
+c_tvm = tvm.nd.array(np.random.rand(16, 128, 128).astype("float32"))
+after_rt_lib["bmm_relu"](a_tvm, b_tvm, c_tvm)
+before_timer = before_rt_lib.time_evaluator("bmm_relu", tvm.cpu())
+print("Before transformation:")
+print(before_timer(a_tvm, b_tvm, c_tvm))
+
+f_timer = after_rt_lib.time_evaluator("bmm_relu", tvm.cpu())
+print("After transformation:")
+print(f_timer(a_tvm, b_tvm, c_tvm))
 
